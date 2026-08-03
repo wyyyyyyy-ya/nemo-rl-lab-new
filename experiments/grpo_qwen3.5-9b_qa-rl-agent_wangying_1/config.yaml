@@ -1,0 +1,124 @@
+# 多轮 QA Agent GRPO：Qwen3.5-9B 在技术培训考题上强化训练（可检索 /data/docs）。
+# 继承 GRPO 基底 + qwen3.5-9b，使用单机 DTensor + LoRA；入口为本目录 run.py + QAAgentEnv。
+#
+# 与 grpo_qwen3.5-9b_qa-rl_v1（单轮 baseline）对比：本实验允许多轮 <search> 检索后再 \boxed{} 作答。
+defaults:
+  - ../../configs/base/grpo_math_1B.yaml
+  - ../../configs/models/qwen3.5-9b.yaml
+
+# ───────────────────────────── ① 调参区（按需改）─────────────────────────────
+policy:
+  model_name: "Qwen/Qwen3.5-9B-Base"
+  tokenizer:
+    name: "Qwen/Qwen3.5-9B-Base"
+  dtensor_cfg:
+    enabled: true
+    lora_cfg:
+      enabled: true
+      match_all_linear: true
+      dim: 8
+      alpha: 16
+  optimizer:
+    kwargs:
+      lr: 1.0e-4
+      weight_decay: 0.0
+  # 单 GB10 第一阶段冒烟配置：先稳定跑通，再按 README 的阶梯逐步放大。
+  max_total_sequence_length: 3072
+  train_global_batch_size: 32
+  generation:
+    # 单轮只需完成一次 search/read/boxed 动作；限制失控重复的最大长度。
+    max_new_tokens: 256
+    vllm_cfg:
+      gpu_memory_utilization: 0.4
+
+grpo:
+  num_prompts_per_step: 4
+  num_generations_per_prompt: 8
+  max_rollout_turns: 6
+  # 第一阶段先跑到 200；每 20 step 观察 boxed/read/repetition 指标，稳定后再续训。
+  max_num_steps: 300
+  val_period: 30
+  val_at_start: true
+  val_at_end: true
+  max_val_samples: 128
+  val_batch_size: 64
+  skip_reference_policy_logprobs_calculation: false
+
+loss_fn:
+  # 恢复旧稳定实验的 KL 约束，防止 LoRA 策略快速偏离基础模型并发生语言退化。
+  reference_policy_kl_penalty: 0.01
+
+# ────────────────────────── ② 数据 / 环境 / 日志 ──────────────────────────
+data:
+  shuffle: true
+  input_key: query
+  output_key: expected_answer
+  system_prompt: null
+  data_dir: /data/datasets/qa_rl
+
+env:
+  _override_: true
+  qa_agent:
+    cfg:
+      docs_dir: /data/docs
+      max_searches: 3
+      max_reads: 2
+      search_document_top_k: 3
+      read_context_before: 2
+      read_context_after: 2
+      read_max_chars: 1200
+      # Actor 启动时一次建段落级 BM25 索引；每次 search 不再扫描/重读全部文件。
+      search_top_k: 3
+      snippet_chars: 400
+      search_chunk_chars: 600
+      search_chunk_overlap: 80
+      search_per_file_limit: 2
+      # 单 GB10 冒烟阶段限制常驻 BM25 索引规模，避免 Python Counter
+      # 与模型争用统一内存；链路稳定后再逐级扩大。
+      search_max_files: 3000
+      search_max_chunks: 5000
+      # 完整核心术语优先；全库补充采用更严格准入，避免“分离柱”误召回“活塞分离/双作用”。
+      search_require_core_term: true
+      search_exact_term_boost: 5.0
+      search_global_min_raw_term_coverage: 0.67
+      search_route_directory_count: 3
+      search_route_document_count: 15
+      search_rerank_pool_size: 40
+      search_global_supplement_count: 5
+      search_catalog_keyword_count: 12
+      search_route_cache_documents: 32
+      # 多词 query 至少共同命中 2 个 token，并满足 token 或原始词覆盖率，过滤单高频词噪声。
+      search_min_query_coverage: 0.35
+      search_min_matched_tokens: 2
+      search_min_raw_term_coverage: 0.5
+      # 环境不强制是否搜索/是否命中；Agent 自主决定，至少一次搜索仅由 system prompt 软约束。
+      auto_fallback_search: true
+      # 三次自主搜索全部无结果后，环境额外执行一次题干 fallback（不占自主额度）。
+      fallback_after_failed_searches: 3
+      fallback_penalty: -0.05
+      fallback_counts_as_hit: false
+      # BM25 直接综合整条 query；不再把长 query 拆开后按子查询顺序拼结果。
+      split_long_search: false
+      split_max_len: 30
+      use_judge: true
+      invalid_action_penalty: -0.1
+      placeholder_query_penalty: -0.2
+      no_search_before_answer_penalty: -0.3
+      # 搜索过但没有发现答案证据时，过早凭常识作答。
+      answer_without_evidence_penalty: -0.2
+      # 合法工具也有极小成本，避免为了中间奖励拉长轨迹。
+      search_cost: -0.005
+      read_cost: -0.005
+      mixed_action_penalty: -0.3
+      repeated_query_penalty: -0.1
+      invalid_read_penalty: -0.2
+      repeated_read_penalty: -0.1
+      # 仅对“read 新增真实答案证据且最终完全答对”的轨迹延迟发放。
+      valid_read_bonus: 0.02
+      fabricated_results_penalty: -0.5
+logger:
+  wandb_enabled: false
+  tensorboard_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true
+  num_val_samples_to_print: 3
